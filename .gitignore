@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# local lakehouse demo data
+lakehouse-demo-data/
