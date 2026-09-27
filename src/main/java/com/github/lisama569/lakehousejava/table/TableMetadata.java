@@ -14,6 +14,10 @@ public final class TableMetadata {
     public long currentVersion;
     public List<StoredColumn> schema = new ArrayList<>();
     public List<String> primaryKey = new ArrayList<>();
+    /** Null = no count-based retention cap. */
+    public Integer retainLatestVersions;
+    /** Explicitly pinned versions; null/absent is treated as an empty list. */
+    public List<Long> pinnedVersions = new ArrayList<>();
 
     public static final class StoredColumn {
         public String name;

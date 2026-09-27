@@ -1,8 +1,9 @@
-# lakehouse-java：本地数据湖表（写入 / 快照 / 时间旅行 / 结构演进 / 整理）
+# lakehouse-java：本地数据湖表（写入 / 快照 / 时间旅行 / 结构演进 / 整理 / 保留与回收）
 
 一套**完全离线、仅依赖本地文件系统**的迷你数据湖表实现。不需要任何外部服务、数据库或真实凭据，
 用 JSON 文件模拟数据表的数据文件、删除标记与提交清单（commit manifest），在重复操作与并发提交下
-给出一致且可解释的结论。
+给出一致且可解释的结论。历史版本默认**全部保留**；只有在显式设置保留策略并手动触发回收时，
+才会删除确实不再需要的版本数据。
 
 核心代码位于 `src/main/java/com/github/lisama569/lakehousejava/table/`，
 测试位于 `src/test/java/com/github/lisama569/lakehousejava/table/`。
@@ -14,12 +15,12 @@
 要求：JDK 21+、Maven（依赖已在本地缓存时可全程离线，加 `-o`）。
 
 ```bash
-# 1) 跑全部单测（24 个），日志中会打印写入批次、版本号、判定依据
+# 1) 跑全部单测（43 个），日志中会打印写入批次、版本号、判定依据
 mvn -o test
 
-# 2) 运行端到端演示（建表、写入、拒绝、结构演进、冲突、时间旅行、整理）
+# 2) 运行端到端演示（建表、写入、拒绝、结构演进、冲突、时间旅行、整理、保留与回收）
 mvn -o spring-boot:run -Dspring-boot.run.arguments=demo
-# 可指定数据目录：
+# 可指定数据目录（演示可重复运行，观察 GC 代次递增）：
 # mvn -o spring-boot:run -Dspring-boot.run.arguments="demo ./tmp-wh"
 ```
 
@@ -49,6 +50,13 @@ r.duplicateKeysCollapsed(); // 1（同批重复主键按“最后一条生效”
 
 t.readSnapshot(1L);         // 时间旅行：读指定版本，后续写入/整理后结论不变
 t.readSnapshot(null);       // 读最新版本
+
+// 历史保留与回收（默认全部保留；只有显式触发才删除）
+t.setRetentionPolicy(RetentionPolicy.of(2, List.of(1L))); // 保留最近2个 + 钉住v1（仅登记，不删除）
+ExpireResult gc = t.expireSnapshots(t.currentVersion());  // 显式回收，携带并发版本前提
+gc.retainedVersions();      // [1, ..., 最新-1, 最新]
+gc.bytesReclaimed();        // 实际回收的字节
+t.readSnapshot(2L);         // 被回收的版本 -> VERSION_EXPIRED（区别于 VERSION_NOT_FOUND）
 ```
 
 ---
@@ -57,14 +65,16 @@ t.readSnapshot(null);       // 读最新版本
 
 ```
 <warehouse>/<table>/
-  _lakehouse.json                当前元数据（当前版本号 + 当前 schema），临时文件 + 原子 move 替换
+  _lakehouse.json                当前元数据（当前版本号 + 当前 schema + 保留策略），临时文件 + 原子 move 替换
+  _retention.json                最近一次回收（GC）发布的保留状态：仍可读的版本/物化快照、已过期版本台账
   commits/0.commit.json          v0：建表时的空全量快照（full snapshot），所有回溯链的锚点
-  commits/1.commit.json          每次成功提交一个不可变清单
+  commits/1.commit.json          每次成功提交一个不可变清单（回收后仍保留，供 history / schema 查询）
   commits/2.commit.json
   data/v1.data.json              该次写入的 upsert 行（delta）
   data/v2.data.json
   data/v2.deletes.json           该次写入的删除主键（delete marker）
   data/v5.compact.data.json      整理产生的全量快照数据文件
+  data/v4.retain.v1.json         回收时为仍保留版本 v4 物化出的独立全量快照（.retain.v<GC代>）
 ```
 
 ### 版本与提交
@@ -78,12 +88,17 @@ t.readSnapshot(null);       // 读最新版本
 
 ### 快照读取与时间旅行
 
-- 普通写入是 **delta**：读取版本 V 时，从 V 沿 `parentVersion` 向回走到**最近的全量快照**，
+- 普通写入是 **delta**：读取版本 V 时，从 V 沿 `parentVersion` 向回走到**最近的全量快照**
+  （整理产生的 `COMPACTION` 快照，或回收时为保留版本物化出的 `*.retain.*` 快照），
   再按版本升序重放：upsert 文件按主键覆盖，delete 文件移除主键。
 - 整理（compaction）写出一个**新的全量快照**，使后续回溯只需从该点重放；
   **旧文件一律保留**，所以整理前的每个版本仍按原来的 delta 链解释，结论不变。
+- 回收（见第 7 节）会为每个仍保留的版本物化一份独立全量快照，并删除其原始 delta；
+  该版本之后的读取直接从物化快照开始，结论与回收前**逐行一致**。
 - 行结果按主键排序返回，保证重复读取结论稳定、可直接断言。
-- 读取不存在的版本抛 `TableException(VERSION_NOT_FOUND)`。
+- 读取不存在的版本抛 `TableException(VERSION_NOT_FOUND)`；读取**曾经存在、但已被回收**的版本抛
+  `TableException(VERSION_EXPIRED)`（信息里带导致过期的 GC 代次），两者可区分——
+  “被回收不可读”不等于“这个版本从来没存在过”。
 
 ### 每个版本用各自的 schema 解释
 
@@ -116,7 +131,10 @@ t.readSnapshot(null);       // 读最新版本
 | `SCHEMA_COLUMN_DUPLICATE` | 新增列重名（建表时重名列同样拒绝） |
 | `SCHEMA_COLUMN_DROP_FORBIDDEN` | 删除既有列（一律拒绝，主键列也不允许） |
 | `VERSION_CONFLICT` | 写入基于过期的 `expectedBaseVersion`（乐观锁失败） |
-| `VERSION_NOT_FOUND` | 读取/打开不存在的版本或表 |
+| `VERSION_NOT_FOUND` | 读取/打开不存在的版本或表（从未存在过） |
+| `VERSION_EXPIRED` | 读取一个**曾经存在、但已被回收**的版本（区别于从未存在） |
+| `RETENTION_POLICY_INVALID` | 保留策略非法：保留数量 < 1、钉住不存在/负数/已过期的版本 |
+| `RETENTION_CONFLICT` | 回收基于过期的 `expectedBaseVersion`，期间有新提交成功，整体放弃、不删除任何文件 |
 | `COMPACTION_CONFLICT` | 整理基于过期的 `expectedBaseVersion` |
 | `EMPTY_TABLE_NAME` | 表名为空或含非法字符 |
 
@@ -163,12 +181,113 @@ upsert 语义：主键存在则更新，不存在则插入。写入时按 schema
   - 所有历史版本读取结论与整理前完全一致（测试逐版本比对）；
   - 重复整理结果稳定，不出现数据丢失、重复计数或结论漂移。
 - 整理可重复执行；基于过期版本的整理被明确拒绝。
+- 回收（compaction 之后）也能正常工作：整理与回收都通过同一条“走到最近全量/物化快照再重放”的链路读取，
+  回收后整理仍逐行保持当前内容。
 
 ---
 
-## 7. 测试覆盖与日志
+## 7. 保留策略与历史回收（Retention & GC，显式触发）
 
-`mvn -o test` 共 24 个用例：
+**默认行为不变**：不设置策略、不调用回收时，任何文件都不会被删除（与旧版本完全一致）。
+回收只在显式调用 `expireSnapshots(...)` 时发生。
+
+### 7.1 设置保留策略（只登记意图，不删任何东西）
+
+```java
+// 只保留最近 2 个版本
+t.setRetentionPolicy(RetentionPolicy.retainLatest(2));
+// 保留最近 2 个版本，并长期钉住 v1
+t.setRetentionPolicy(RetentionPolicy.of(2, List.of(1L)));
+// 不按数量裁剪，只额外钉住某些版本
+t.setRetentionPolicy(RetentionPolicy.pin(List.of(1L, 3L)));
+// 恢复“全部保留”
+t.setRetentionPolicy(null); // 或 RetentionPolicy.keepAll()
+```
+
+- `retainLatestVersions`：保留最近 N 个版本，**N 必须 ≥ 1**；为 `null` 表示不按数量裁剪。
+- `pinnedVersions`：显式**钉住**、需要长期保留的版本；自动去重并排序。
+  - 钉住的版本必须真实存在（不能是未来版本或负数），且**不能是已经被回收的版本**，否则
+    `RETENTION_POLICY_INVALID`。
+- 最新（current）版本**始终保留**。
+- 设置策略只是把意图原子写入 `_lakehouse.json`，**不产生删除、不让任何版本变得不可读**。
+
+### 7.2 触发回收：`expireSnapshots(expectedBaseVersion)`
+
+```java
+ExpireResult r = t.expireSnapshots(5L); // 基于“当前=5”这一前提执行
+r.committed();            // 是否发布了新的保留状态（重试只做剩余清理时为 false）
+r.baseVersion();          // 本次回收依据的当前版本
+r.retainedVersions();     // 回收后仍可读的版本（钉住 ∪ 最近 N 个 ∪ 最新）
+r.expiredVersions();      // 本次新变为不可读的版本
+r.previouslyExpired();    // 之前就已不可读的版本
+r.filesDeleted();         // 实际删除的文件
+r.bytesReclaimed();       // 实际回收的字节数（被删文件大小之和）
+```
+
+回收做了什么（固定在一个 base 版本上计算，整个过程持表锁）：
+
+1. **决定保留集**：`{最新版本} ∪ {最近 N 个版本} ∪ {钉住的版本}`；其余版本标记为“过期”。
+2. **物化保护（dependency protection）**：为每个仍保留的版本，用**该版本自己当时的 schema**
+   重放出一份独立全量快照 `data/v<R>.retain.v<代>.json`。因此即使该版本原本依赖的中间 delta
+   被删除，它仍然可以独立读出，且结论与回收前**逐行一致**（测试逐版本比对，不丢行、不多行、不漂移）。
+3. **先发布、后删除**：把新的保留状态（保留集 + 物化快照位置 + 累积的过期台账）原子写入
+   `_retention.json`，**然后**才删除物理文件。删除集合只包含“新保留集与 base 之后的新提交都不再引用”
+   的数据文件；上一代物化快照、过期版本的原始 delta/delete 文件都会被回收。
+4. 提交清单 `commits/<v>.commit.json` **始终保留**：`history()` 仍列出每个版本，过期版本带
+   `expired=true` 标记，其 schema 仍可解释；被删的只是数据/删除文件本身。
+
+### 7.3 哪些版本在什么情况下变得不可读
+
+- 版本 V 在一次成功回收后变得不可读，当且仅当：`V ≤ 本次 base` 且 V **既不在最近 N 个版本里，
+  也没有被钉住，也不是最新版本**。
+- 之后再读 V 抛 `VERSION_EXPIRED`（消息含 GC 代次），与读取一个**从未存在**的版本得到的
+  `VERSION_NOT_FOUND` 明确区分。
+- base 之后新提交产生的版本与文件**绝不会**被本次回收删除（回收只处理 `≤ base` 的文件，
+  新提交在锁上严格发生在回收之前或之后）。
+- 一旦某版本被回收即不可恢复，也不能再被钉住（防止给出“已钉住但读不出来”的假承诺）。
+- 钉住一个旧 schema 下的版本：该版本按它**自己当时的 schema** 读出（之后新增的列不出现），
+  结构演进 + 回收交错也不受影响。
+
+### 7.4 并发控制：带版本前提，失效即整体放弃
+
+- `expireSnapshots(expectedBaseVersion)` 携带“我认为当前版本是 X”的前提。执行时持表锁重新读取，
+  若期间有新的写入/演进/整理提交成功导致当前版本 ≠ X，直接抛 `RETENTION_CONFLICT`：
+  **不物化、不发布、不删除任何文件**，不会删到一半，也不会让某个已成功提交、仍在保留范围内的版本变不可读。
+  调用方应以新版本重新计算保留集后重试。
+- 传 `null` 表示不做前置版本检查（仍在表锁内串行执行）。
+- 回收与写入共用按表 `ReentrantLock`：同一 JVM 内二者严格串行；并发测试验证了“写入先赢则回收得到
+  明确冲突，回收先赢则已提交的当前版本一定仍可读”。
+
+### 7.5 中断与重试：安全、结论唯一
+
+回收采用“**先原子发布状态，再删除文件**”的顺序，因此在任意时刻崩溃都安全：
+
+| 崩溃点 | 磁盘上的状态 | 重新执行 `expireSnapshots` 的结果 |
+| --- | --- | --- |
+| 发布状态之前（如前提冲突） | 完全没有改动 | 所有版本照常可读，无垃圾 |
+| 状态已发布、尚未删除 | 新状态已生效，旧文件还在（多占空间但无害） | 识别为同一 base+保留集，只补做剩余删除，不重新发布 |
+| 删除到一半 | 部分垃圾已删、部分还在 | 同上，`deleteIfExists` 幂等，最终删除集合唯一 |
+
+- 重复回收：同一 base、同一策略下再次执行是**幂等 no-op**（`committed=false`、`filesDeleted=0`），
+  保留版本的读取结论不变，无重复计数。
+- 策略收紧但没有新提交（base 相同）时，再执行会按新保留集发布新一代物化快照并回收新过期的版本；
+  策略放宽不会让已过期版本复活（其数据已删除）。
+- 回收之后继续写入：新版本以最新保留版本的物化快照为锚点做 delta 重放，结论正确；
+  再次回收会重新物化并保持结论一致。
+- 为可验证中断恢复，代码提供了包内可见的崩溃注入钩子 `ExpireHook`
+  （`failAfterPublish()` / `failAfterDeletes(n)`），仅测试使用。
+
+### 7.6 磁盘占用可观察下降
+
+`ExpireResult.bytesReclaimed()` 给出本次删除文件的字节总和；测试同时对整个表目录前后做
+`Files.walk` 求和，断言回收后**总磁盘占用确实下降**（用大块 payload 放大旧 delta，使回收量
+明显大于新写的物化快照）。
+
+---
+
+## 8. 测试覆盖与日志
+
+`mvn -o test` 共 43 个用例：
 
 - `WriteValidationTest`（9）：按主键 upsert/update/delete、同批重复主键收敛、delete 覆盖 upsert、
   四类写入拒绝原因可区分、非法批次无部分生效、重复批次最终状态唯一。
@@ -178,6 +297,16 @@ upsert 语义：主键存在则更新，不存在则插入。写入时按 schema
   重名/坏缺省区分、`LONG->DOUBLE` 拓宽与反向拒绝、删列禁止、整理后逐版本结论一致、整理冲突、重复整理稳定。
 - `PersistenceReopenTest`（1）：丢弃引擎后重新打开同一目录，版本/历史/冲突检测全部保持。
 - `EndToEndIntegrationTest`（1）：完整生命周期串联。
+- `RetentionPolicyTest`（6）：默认全部保留且“只设策略不删除”、保留数量校验、钉住版本必须存在、
+  不能钉住已过期版本、策略持久化与重置、默认 keep-all 下回收为 no-op。
+- `RetentionExpirationTest`（13）：
+  - **依赖保护**：保留版本（含钉住）回收后逐行结论一致、过期版本不可读且与“从未存在”区分、history 标记；
+  - **并发交错**：过期 base 回收整体 `RETENTION_CONFLICT` 且零删除、回收与写入并发互不破坏；
+  - **中断重试**：发布后崩溃 / 删除中途崩溃后重试收敛、发布前冲突无副作用、无孤儿快照或临时文件；
+  - **重复回收**幂等、无重复计数；
+  - 回收后继续写入 / 整理 / 结构演进（钉住旧 schema 版本）结论正确；
+  - 重新打开目录后保留/过期状态保持；
+  - 大块历史下回收后**整目录磁盘占用下降**。
 
 单测与演示日志（SLF4J / stdout）会打印：
 
@@ -185,19 +314,52 @@ upsert 语义：主键存在则更新，不存在则插入。写入时按 schema
 table=users write batch COMMITTED decision=OK base=0 newVersion=1 ops=4 upserts=2 ...
 table=users write batch REJECTED decision=VERSION_CONFLICT expectedBase=0 actualBase=1 ops=1
 table=ledger compact COMMITTED decision=OK base=4 newVersion=5 liveRows=2 ... (old files retained)
+table=t retention policy SET retainLatest=2 pinned=[1]
+table=t retention state PUBLISHED generation=1 base=6 retained=[2, 5, 6] expiredNow=[0, 1, 3, 4] ...
+table=t expire COMMITTED decision=OK generation=1 base=6 ... filesDeleted=7 bytesReclaimed=1234
+table=t expire RETRY-CLEANUP decision=OK ... filesDeleted=3 ...
+table=t expire REJECTED decision=RETENTION_CONFLICT expected=4 actual=5
 ```
 
-即“写入批次内容 / 基准版本 / 新版本号 / upsert/delete/收敛计数 / 判定依据”均可在日志中解释。
+即“写入批次内容 / 基准版本 / 新版本号 / upsert/delete/收敛计数 / 保留集 / 过期集 / 删除文件数与
+回收字节数 / 判定依据”均可在日志中解释。
 
 ---
 
-## 8. 主要类型
+## 9. 主要类型
 
 | 类型 | 作用 |
 | --- | --- |
 | `LakehouseEngine` / `LocalLakehouseEngine` | 本地仓库入口：建表、打开表 |
-| `TableManager` / `LocalTableManager` | 单表：写入、快照读取、history、加列、改类型、删列、整理 |
+| `TableManager` / `LocalTableManager` | 单表：写入、快照读取、history、加列、改类型、删列、整理、保留策略与回收 |
+| `RetentionPolicy` | 保留策略：最近 N 个版本 + 钉住版本（`retainLatest/of/pin/keepAll`） |
+| `ExpireResult` | 一次回收的结论：保留/过期版本、删除文件、回收字节、是否新发布 |
+| `RetentionState` | `_retention.json`：保留版本→物化快照映射与累积过期台账 |
+| `ExpireHook` | 仅测试用的崩溃注入钩子（发布后 / 删除到第 N 个文件时中断） |
 | `Schema` / `Column` / `DataType` / `Schemas` | 表结构、类型（STRING/LONG/DOUBLE/BOOLEAN）与校验/强转 |
 | `Row` / `RowOp` / `WriteBatch` | 行、upsert/delete 操作、带基准版本的批次 |
 | `WriteResult` / `RejectedRow` / `RejectReasonCode` | 提交结果与可区分拒绝原因 |
-| `CommitRecord` / `TableMetadata` / `JsonStore` | 提交清单、表元数据与原子 JSON 持久化 |
+| `CommitRecord` / `CommitInfo` / `TableMetadata` / `JsonStore` | 提交清单（含过期标记）、表元数据与原子 JSON 持久化 |
+
+---
+
+## 10. 本地验证方法
+
+```bash
+# 全部单测（43 个），离线可复现
+mvn -o test
+
+# 端到端演示：建表、写入、拒绝、结构演进、冲突、时间旅行、整理、保留与回收
+mvn -o spring-boot:run -Dspring-boot.run.arguments="demo"
+# 指定数据目录，并可重复运行（演示对重复运行幂等；可观察 GC 代次 gcGeneration 递增）：
+mvn -o spring-boot:run -Dspring-boot.run.arguments="demo ./tmp-wh"
+mvn -o spring-boot:run -Dspring-boot.run.arguments="demo ./tmp-wh"
+```
+
+回收后可直接打开检查：
+
+- `_lakehouse.json`：当前版本、schema 与保留策略（`retainLatestVersions` / `pinnedVersions`）。
+- `_retention.json`：`gcBaseVersion`、`gcGeneration`、`retained[].snapshotFile` 与累积 `expired[]` 台账。
+- `commits/`：提交清单始终都在（history 可查，过期版本带标记）。
+- `data/`：只剩“保留版本的物化快照（`*.retain.v*`）”与“base 之后新提交”的数据文件。
+

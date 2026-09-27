@@ -40,6 +40,7 @@ public final class LocalTableManager implements TableManager {
     private static final ConcurrentHashMap<String, ReentrantLock> LOCKS = new ConcurrentHashMap<>();
 
     static final String META_FILE = "_lakehouse.json";
+    static final String RETENTION_FILE = "_retention.json";
 
     private final Path tableDir;
     private final String name;
@@ -83,17 +84,23 @@ public final class LocalTableManager implements TableManager {
     @Override
     public Schema schemaAt(Long versionOrNull) {
         long v = versionOrNull == null ? currentVersion() : versionOrNull;
+        if (isExpired(v)) {
+            throw new TableException(RejectReasonCode.VERSION_EXPIRED,
+                    "table '" + name + "' version " + v + " was expired by retention");
+        }
         return readCommit(v).toSchema();
     }
 
     @Override
     public List<CommitInfo> history() {
         Path dir = commitsDir();
+        java.util.Set<Long> expiredSet = new java.util.HashSet<>(expiredVersions());
         List<CommitInfo> out = new ArrayList<>();
         try (var stream = Files.list(dir)) {
             stream.filter(p -> p.getFileName().toString().endsWith(".commit.json")).forEach(p -> {
                 CommitRecord cr = json.read(p, CommitRecord.class);
-                out.add(new CommitInfo(cr.version, cr.commitKind(), cr.timestampMs, cr.description));
+                out.add(new CommitInfo(cr.version, cr.commitKind(), cr.timestampMs, cr.description,
+                        expiredSet.contains(cr.version)));
             });
         } catch (IOException e) {
             throw new UncheckedIOException("failed to list commits of " + name, e);
@@ -196,7 +203,16 @@ public final class LocalTableManager implements TableManager {
 
     @Override
     public List<Row> readSnapshot(Long versionOrNull) {
-        long version = versionOrNull == null ? currentVersion() : versionOrNull;
+        TableMetadata meta = loadMeta();
+        RetentionState retention = loadRetentionStateOrNull();
+        long version = versionOrNull == null ? meta.currentVersion : versionOrNull;
+        if (retention != null && retention.expired.stream().anyMatch(e -> e.version == version)) {
+            throw new TableException(RejectReasonCode.VERSION_EXPIRED,
+                    "table '" + name + "' version " + version
+                            + " once existed but was expired by retention run generation "
+                            + expiredGeneration(retention, version)
+                            + "; it is no longer readable (distinct from a version that never existed)");
+        }
         if (!Files.isRegularFile(commitPath(version))) {
             throw new TableException(RejectReasonCode.VERSION_NOT_FOUND,
                     "table '" + name + "' has no version " + version);
@@ -204,23 +220,105 @@ public final class LocalTableManager implements TableManager {
         CommitRecord target = readCommit(version);
         Schema schema = target.toSchema();
 
-        // Walk back to the nearest full snapshot, then replay deltas in order.
-        List<CommitRecord> chain = new ArrayList<>();
+        // Walk back to the nearest full snapshot (or a GC-materialized retained snapshot),
+        // then replay deltas in order.
+        List<ReplayStep> chain = collectChain(version, retention);
+
+        TreeMap<String, Map<String, Object>> rows = replayChain(chain, target.primaryKey);
+
+        List<Row> result = new ArrayList<>();
+        for (Map<String, Object> raw : rows.values()) {
+            result.add(projectForRead(raw, schema));
+        }
+        String kind = retention != null && retentionEntry(retention, version) != null
+                ? (version == meta.currentVersion ? "RETAINED_LATEST" : "RETAINED")
+                : (target.fullSnapshot ? "FULL" : "DELTA_REPLAY");
+        log.info("table={} read snapshot version={} rows={} snapshotKind={}", name, version, result.size(), kind);
+        return result;
+    }
+
+    private static long expiredGeneration(RetentionState state, long version) {
+        return state.expired.stream().filter(e -> e.version == version).findFirst()
+                .map(e -> e.gcGeneration).orElse(-1L);
+    }
+
+    private static RetentionState.Entry retentionEntry(RetentionState state, long version) {
+        if (state == null) {
+            return null;
+        }
+        return state.retained.stream().filter(e -> e.version == version).findFirst().orElse(null);
+    }
+
+    /**
+     * Collect the ascending replay chain for {@code version}: backwards along the
+     * parent chain until a commit marked full snapshot, or until a version that
+     * the retention state materialized as a standalone snapshot (GC boundary).
+     */
+    private List<ReplayStep> collectChain(long version, RetentionState retention) {
+        List<ReplayStep> chain = new ArrayList<>();
         long cursor = version;
         while (true) {
-            CommitRecord cr = readCommit(cursor);
-            chain.add(0, cr);
+            RetentionState.Entry boundary = retentionEntry(retention, cursor);
+            CommitRecord cr;
+            if (boundary != null) {
+                cr = readExistingCommit(cursor, retention);
+                chain.add(0, new ReplayStep(cr, boundary.snapshotFile));
+                return chain;
+            }
+            Path p = commitPath(cursor);
+            if (!Files.isRegularFile(p)) {
+                final long missing = cursor;
+                // Manifest was physically removed as garbage: it can only be an expired version.
+                if (retention != null && retention.expired.stream().anyMatch(e -> e.version == missing)) {
+                    throw new TableException(RejectReasonCode.VERSION_EXPIRED,
+                            "table '" + name + "' version " + missing
+                                    + " once existed but was expired by retention and cannot be replayed");
+                }
+                throw new TableException(RejectReasonCode.VERSION_NOT_FOUND,
+                        "table '" + name + "' has no version " + missing);
+            }
+            cr = json.read(p, CommitRecord.class);
+            chain.add(0, new ReplayStep(cr, null));
             if (cr.fullSnapshot) {
-                break;
+                return chain;
             }
             if (cursor == 0) {
                 throw new IllegalStateException("no full snapshot reached before version 0");
             }
             cursor--;
         }
+    }
 
+    private CommitRecord readExistingCommit(long version, RetentionState retention) {
+        Path p = commitPath(version);
+        if (!Files.isRegularFile(p)) {
+            if (retention != null && retention.expired.stream().anyMatch(e -> e.version == version)) {
+                throw new TableException(RejectReasonCode.VERSION_EXPIRED,
+                        "table '" + name + "' version " + version + " was expired by retention");
+            }
+            throw new TableException(RejectReasonCode.VERSION_NOT_FOUND,
+                    "table '" + name + "' has no version " + version);
+        }
+        return json.read(p, CommitRecord.class);
+    }
+
+    private record ReplayStep(CommitRecord commit, String fullSnapshotFile) {
+    }
+
+    /** Replay an ascending chain: a materialized full-snapshot step resets rows, then deltas apply. */
+    private TreeMap<String, Map<String, Object>> replayChain(List<ReplayStep> chain, List<String> primaryKey) {
         TreeMap<String, Map<String, Object>> rows = new TreeMap<>();
-        for (CommitRecord cr : chain) {
+        for (ReplayStep step : chain) {
+            if (step.fullSnapshotFile != null) {
+                // GC-materialized boundary: the snapshot already contains this
+                // version's complete state, so its own delta files must not replay.
+                rows.clear();
+                for (Map<String, Object> raw : readRows(step.fullSnapshotFile)) {
+                    rows.put(encodeStoredKey(raw, primaryKey), raw);
+                }
+                continue;
+            }
+            CommitRecord cr = step.commit;
             for (String rel : cr.dataFiles) {
                 for (Map<String, Object> raw : readRows(rel)) {
                     rows.put(encodeStoredKey(raw, cr.primaryKey), raw);
@@ -232,14 +330,7 @@ public final class LocalTableManager implements TableManager {
                 }
             }
         }
-
-        List<Row> result = new ArrayList<>();
-        for (Map<String, Object> raw : rows.values()) {
-            result.add(projectForRead(raw, schema));
-        }
-        log.info("table={} read snapshot version={} rows={} snapshotKind={}",
-                name, version, result.size(), target.fullSnapshot ? "FULL" : "DELTA_REPLAY");
-        return result;
+        return rows;
     }
 
     // -------------------------------------------------------- schema evolution
@@ -333,29 +424,10 @@ public final class LocalTableManager implements TableManager {
             }
             Schema schema = meta.toSchema();
 
-            TreeMap<String, Map<String, Object>> current = new TreeMap<>();
-            long cursor = base;
-            List<CommitRecord> chain = new ArrayList<>();
-            while (true) {
-                CommitRecord cr = readCommit(cursor);
-                chain.add(0, cr);
-                if (cr.fullSnapshot) {
-                    break;
-                }
-                cursor--;
-            }
-            for (CommitRecord cr : chain) {
-                for (String rel : cr.dataFiles) {
-                    for (Map<String, Object> raw : readRows(rel)) {
-                        current.put(encodeStoredKey(raw, cr.primaryKey), raw);
-                    }
-                }
-                for (String rel : cr.deleteFiles) {
-                    for (String key : readKeys(rel)) {
-                        current.remove(key);
-                    }
-                }
-            }
+            // Replay through GC-materialized snapshots as well, so compaction works
+            // after expiration removed older delta files.
+            TreeMap<String, Map<String, Object>> current = replayChain(collectChain(base, loadRetentionStateOrNull()),
+                    schema.primaryKey());
 
             long newVersion = base + 1;
             List<Map<String, Object>> compacted = new ArrayList<>();
@@ -378,6 +450,315 @@ public final class LocalTableManager implements TableManager {
             return newVersion;
         } finally {
             lock.unlock();
+        }
+    }
+
+    // ------------------------------------------------------------- retention
+
+    @Override
+    public void setRetentionPolicy(RetentionPolicy policy) {
+        ReentrantLock lock = lockFor();
+        lock.lock();
+        try {
+            TableMetadata meta = loadMeta();
+            RetentionPolicy effective = policy == null ? RetentionPolicy.keepAll() : policy;
+            long current = meta.currentVersion;
+            for (Long pinned : effective.pinnedVersions()) {
+                if (pinned < 0 || pinned > current) {
+                    throw reject(RejectReasonCode.RETENTION_POLICY_INVALID,
+                            "pinned version " + pinned + " does not exist (current version is " + current + ")");
+                }
+                if (isExpired(pinned)) {
+                    throw reject(RejectReasonCode.RETENTION_POLICY_INVALID,
+                            "version " + pinned + " was already expired and cannot be pinned");
+                }
+            }
+            meta.retainLatestVersions = effective.retainLatestVersions();
+            meta.pinnedVersions = new ArrayList<>(effective.pinnedVersions());
+            json.writeAtomic(metaPath(), meta);
+            log.info("table={} retention policy SET retainLatest={} pinned={}",
+                    name, effective.retainLatestVersions(), effective.pinnedVersions());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public RetentionPolicy retentionPolicy() {
+        TableMetadata meta = loadMeta();
+        List<Long> pinned = meta.pinnedVersions == null ? List.of() : List.copyOf(meta.pinnedVersions);
+        return new RetentionPolicy(meta.retainLatestVersions, pinned);
+    }
+
+    @Override
+    public List<Long> readableVersions() {
+        ReentrantLock lock = lockFor();
+        lock.lock();
+        try {
+            RetentionState state = loadRetentionStateOrNull();
+            if (state == null) {
+                long current = loadMeta().currentVersion;
+                List<Long> all = new ArrayList<>();
+                for (long v = 0; v <= current; v++) {
+                    all.add(v);
+                }
+                return all;
+            }
+            return state.retained.stream().map(e -> e.version).sorted().toList();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public List<Long> expiredVersions() {
+        RetentionState state = loadRetentionStateOrNull();
+        if (state == null) {
+            return List.of();
+        }
+        return state.expired.stream().map(e -> e.version).sorted().toList();
+    }
+
+    private RetentionState loadRetentionStateOrNull() {
+        Path p = retentionPath();
+        if (!Files.isRegularFile(p)) {
+            return null;
+        }
+        return json.read(p, RetentionState.class);
+    }
+
+    private boolean isExpired(long version) {
+        RetentionState state = loadRetentionStateOrNull();
+        if (state == null) {
+            return false;
+        }
+        return state.expired.stream().anyMatch(e -> e.version == version);
+    }
+
+    private Path retentionPath() {
+        return tableDir.resolve(RETENTION_FILE);
+    }
+
+    @Override
+    public ExpireResult expireSnapshots(Long expectedBaseVersion) {
+        return expireSnapshots(expectedBaseVersion, ExpireHook.NOOP);
+    }
+
+    // package-private variant with a crash-injection hook (tests only)
+    ExpireResult expireSnapshots(Long expectedBaseVersion, ExpireHook hook) {
+        ReentrantLock lock = lockFor();
+        lock.lock();
+        try {
+            TableMetadata meta = loadMeta();
+            long base = meta.currentVersion;
+            if (expectedBaseVersion != null && expectedBaseVersion != base) {
+                log.info("table={} expire REJECTED decision=RETENTION_CONFLICT expected={} actual={}",
+                        name, expectedBaseVersion, base);
+                throw new TableException(RejectReasonCode.RETENTION_CONFLICT,
+                        "expiration expected base version " + expectedBaseVersion
+                                + " but current version is " + base + "; nothing was deleted");
+            }
+            RetentionPolicy policy = retentionPolicy();
+            RetentionState oldState = loadRetentionStateOrNull();
+
+            // ----- decide the retained set under a fixed base -----
+            List<Long> retained = computeRetainedVersions(base, policy);
+            List<Long> previouslyExpired = oldState == null
+                    ? new ArrayList<>()
+                    : oldState.expired.stream().map(e -> e.version).sorted().toList();
+
+            // Keep-all policy with no prior expiration: nothing to do, nothing to write.
+            if (oldState == null && retained.size() == base + 1) {
+                log.info("table={} expire decision=NOOP reason=keep-all base={}", name, base);
+                return ExpireResult.noop(base, List.copyOf(retained), List.of());
+            }
+
+            List<Long> newlyExpired = new ArrayList<>();
+            for (long v = 0; v <= base; v++) {
+                if (!retained.contains(v) && !previouslyExpired.contains(v)) {
+                    newlyExpired.add(v);
+                }
+            }
+
+            // ----- resume case: a previous run published this exact base AND retained set -----
+            if (oldState != null && oldState.gcBaseVersion == base
+                    && stateRetainedMatches(oldState, retained)) {
+                return finishDeletion(meta, oldState, retained, newlyExpired, previouslyExpired, hook,
+                        oldState.gcGeneration, false);
+            }
+
+            // ----- materialize every retained version as a standalone full snapshot -----
+            long generation = oldState == null ? 1L : oldState.gcGeneration + 1;
+            List<RetentionState.Entry> entries = materializeRetained(retained, base, generation);
+
+            // ----- publish the new retention state atomically BEFORE deleting anything -----
+            RetentionState newState = new RetentionState();
+            newState.gcBaseVersion = base;
+            newState.gcGeneration = generation;
+            newState.updatedAtMs = System.currentTimeMillis();
+            newState.retained = entries;
+            newState.expired = new ArrayList<>();
+            if (oldState != null) {
+                newState.expired.addAll(oldState.expired);
+            }
+            for (long v : newlyExpired) {
+                newState.expired.add(new RetentionState.ExpiredEntry(v, newState.updatedAtMs, generation));
+            }
+            newState.expired.sort(Comparator.comparingLong(e -> e.version));
+            json.writeAtomic(retentionPath(), newState);
+            log.info("table={} retention state PUBLISHED generation={} base={} retained={} expiredNow={} previouslyExpired={}",
+                    name, generation, base, retained, newlyExpired, previouslyExpired.size());
+
+            ExpireResult published = new ExpireResult(true, base, List.copyOf(retained),
+                    List.copyOf(newlyExpired), List.copyOf(previouslyExpired), new ArrayList<>(), 0L);
+            hook.afterStatePublished(published);
+
+            return finishDeletion(meta, newState, retained, newlyExpired, previouslyExpired, hook,
+                    generation, true);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static boolean stateRetainedMatches(RetentionState state, List<Long> retained) {
+        if (state.retained.size() != retained.size()) {
+            return false;
+        }
+        List<Long> onDisk = state.retained.stream().map(e -> e.version).sorted().toList();
+        return onDisk.equals(retained);
+    }
+
+    private List<Long> computeRetainedVersions(long base, RetentionPolicy policy) {
+        java.util.Set<Long> keep = new java.util.TreeSet<>();
+        keep.add(base); // the current/latest version is always retained
+        if (policy.retainLatestVersions() != null) {
+            int n = policy.retainLatestVersions();
+            long from = Math.max(0L, base - n + 1L);
+            for (long v = from; v <= base; v++) {
+                keep.add(v);
+            }
+        } else {
+            for (long v = 0; v <= base; v++) {
+                keep.add(v);
+            }
+        }
+        keep.addAll(policy.pinnedVersions()); // already validated against the current table
+        return new ArrayList<>(keep);
+    }
+
+    /**
+     * Build one independent full-snapshot data file per retained version, projected
+     * with that version's own schema. Replay is incremental: reuse the replayed rows
+     * at the lowest retained version, then apply each subsequent commit once.
+     */
+    private List<RetentionState.Entry> materializeRetained(List<Long> retained, long base, long generation) {
+        long min = retained.get(0);
+        RetentionState currentState = loadRetentionStateOrNull();
+        TreeMap<String, Map<String, Object>> rows =
+                replayChain(collectChain(min, currentState), readCommit(min).primaryKey);
+
+        List<RetentionState.Entry> entries = new ArrayList<>();
+        long cursor = min;
+        for (long target : retained) {
+            while (cursor < target) {
+                cursor++;
+                CommitRecord cr = readCommit(cursor);
+                for (String rel : cr.dataFiles) {
+                    for (Map<String, Object> raw : readRows(rel)) {
+                        rows.put(encodeStoredKey(raw, cr.primaryKey), raw);
+                    }
+                }
+                for (String rel : cr.deleteFiles) {
+                    for (String key : readKeys(rel)) {
+                        rows.remove(key);
+                    }
+                }
+            }
+            CommitRecord targetCommit = readCommit(target);
+            Schema targetSchema = targetCommit.toSchema();
+            List<Map<String, Object>> snapshot = new ArrayList<>();
+            for (Map<String, Object> raw : rows.values()) {
+                snapshot.add(rowToOrderedMap(projectForRead(raw, targetSchema)));
+            }
+            String rel = "data/v" + target + ".retain.v" + generation + ".json";
+            json.writeAtomic(tableDir.resolve(rel), snapshot);
+            entries.add(new RetentionState.Entry(target, rel,
+                    "commits/" + target + ".commit.json"));
+        }
+        return entries;
+    }
+
+    /**
+     * Delete only files that no retained version (and no commit newer than the GC
+     * base) can still need. Safe to run again: the new state is already on disk, so
+     * re-execution simply deletes whatever remains of the garbage set.
+     */
+    private ExpireResult finishDeletion(TableMetadata meta, RetentionState state, List<Long> retained,
+                                        List<Long> newlyExpired, List<Long> previouslyExpired,
+                                        ExpireHook hook, long generation, boolean freshPublish) {
+        long base = state.gcBaseVersion;
+        java.util.Set<String> keepDataFiles = new java.util.HashSet<>();
+        for (RetentionState.Entry e : state.retained) {
+            keepDataFiles.add(e.snapshotFile);
+        }
+        // Files produced by commits newer than the GC base are still on the live chain.
+        for (long v = base + 1; v <= meta.currentVersion; v++) {
+            CommitRecord cr = readCommit(v);
+            keepDataFiles.addAll(cr.dataFiles);
+            keepDataFiles.addAll(cr.deleteFiles);
+        }
+
+        List<String> deleted = new ArrayList<>();
+        long bytes = 0L;
+
+        // Garbage data files: any data/ JSON not referenced by the new state or newer commits.
+        Path dataDir = tableDir.resolve("data");
+        if (Files.isDirectory(dataDir)) {
+            List<Path> candidates = new ArrayList<>();
+            try (var stream = Files.list(dataDir)) {
+                stream.filter(Files::isRegularFile)
+                        .filter(p -> p.getFileName().toString().endsWith(".json"))
+                        .forEach(candidates::add);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to list data files of " + name, e);
+            }
+            candidates.sort(Comparator.comparing(p -> p.getFileName().toString()));
+            for (Path f : candidates) {
+                String rel = "data/" + f.getFileName();
+                if (keepDataFiles.contains(rel)) {
+                    continue;
+                }
+                long size = fileSize(f);
+                if (deleteQuietly(f)) {
+                    deleted.add(rel);
+                    bytes += size;
+                    hook.afterDeleteStep(rel);
+                }
+            }
+        }
+
+        log.info("table={} expire {} decision=OK generation={} base={} retained={} expiredNow={} filesDeleted={} bytesReclaimed={}",
+                name, freshPublish ? "COMMITTED" : "RETRY-CLEANUP", generation, base, retained,
+                newlyExpired, deleted.size(), bytes);
+        return new ExpireResult(freshPublish, base, List.copyOf(retained),
+                List.copyOf(newlyExpired), List.copyOf(previouslyExpired),
+                List.copyOf(deleted), bytes);
+    }
+
+    private static long fileSize(Path f) {
+        try {
+            return Files.size(f);
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    /** Delete one file; returns false if it was already gone (safe retry). */
+    private static boolean deleteQuietly(Path f) {
+        try {
+            return Files.deleteIfExists(f);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to delete obsolete file " + f, e);
         }
     }
 
