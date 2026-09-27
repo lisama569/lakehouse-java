@@ -33,4 +33,24 @@ public interface TableManager {
     long dropColumn(String columnName);
 
     long compact(Long expectedBaseVersion);
+
+    // ------------------------------------------------------- retention / vacuum
+
+    /** Persist a retention policy (does not itself delete anything or add a version). */
+    void setRetentionPolicy(RetentionPolicy policy);
+
+    /** Currently persisted retention policy, or {@code null} when none was ever set. */
+    RetentionPolicy retentionPolicy();
+
+    /**
+     * Explicitly reclaim data files no longer needed by the latest version or by any
+     * retained (pinned / recent-window) version. Requires a policy set beforehand.
+     *
+     * @param expectedBaseVersion premise: the current version the caller observed;
+     *                            {@code null} skips the premise check
+     */
+    VacuumResult vacuum(Long expectedBaseVersion);
+
+    /** Durable vacuum ledger, ordered by attempt sequence. */
+    List<VacuumRecord> vacuumHistory();
 }

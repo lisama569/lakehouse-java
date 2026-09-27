@@ -10,10 +10,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -28,10 +31,13 @@ import java.util.concurrent.locks.ReentrantLock;
  *   data/&lt;v&gt;.deletes.json           deleted primary keys of one write
  * </pre>
  *
- * <p>Every successful commit appends a new version; files are never deleted, so
- * any historical version remains reproducible after later writes and compactions.</p>
+ * <p>Every successful commit appends a new version. Writes, schema evolution and
+ * compaction never delete files; only an explicit {@link #vacuum(Long)} (after a
+ * {@link RetentionPolicy} has been set) reclaims data files that no retained version
+ * needs. Commit manifests under {@code commits/} are never deleted, so a reclaimed
+ * version remains distinguishable from a version that never existed.</p>
  */
-public final class LocalTableManager implements TableManager {
+public class LocalTableManager implements TableManager {
 
     private static final Logger log = LoggerFactory.getLogger(LocalTableManager.class);
     private static final String KEY_SEP = "\u001f";
@@ -222,6 +228,16 @@ public final class LocalTableManager implements TableManager {
         TreeMap<String, Map<String, Object>> rows = new TreeMap<>();
         for (CommitRecord cr : chain) {
             for (String rel : cr.dataFiles) {
+                if (!Files.isRegularFile(tableDir.resolve(rel))) {
+                    throw expired(version, rel);
+                }
+            }
+            for (String rel : cr.deleteFiles) {
+                if (!Files.isRegularFile(tableDir.resolve(rel))) {
+                    throw expired(version, rel);
+                }
+            }
+            for (String rel : cr.dataFiles) {
                 for (Map<String, Object> raw : readRows(rel)) {
                     rows.put(encodeStoredKey(raw, cr.primaryKey), raw);
                 }
@@ -382,6 +398,273 @@ public final class LocalTableManager implements TableManager {
     }
 
     // ------------------------------------------------------------- internals
+
+    // ------------------------------------------------- retention / vacuum
+
+    @Override
+    public void setRetentionPolicy(RetentionPolicy policy) {
+        if (policy == null) {
+            throw reject(RejectReasonCode.RETENTION_POLICY_INVALID, "retention policy must not be null");
+        }
+        ReentrantLock lock = lockFor();
+        lock.lock();
+        try {
+            TableMetadata meta = loadMeta();
+            for (Long pinned : policy.pinnedVersions()) {
+                if (pinned == null || pinned < 0 || pinned > meta.currentVersion) {
+                    throw reject(RejectReasonCode.RETENTION_POLICY_INVALID,
+                            "pinned version " + pinned + " does not exist on table '" + name
+                                    + "' (current version " + meta.currentVersion + ")");
+                }
+            }
+            meta.minVersionsToKeep = policy.minVersionsToKeep();
+            meta.pinnedVersions = new ArrayList<>(policy.pinnedVersions());
+            json.writeAtomic(metaPath(), meta);
+            log.info("table={} retention policy SET minVersionsToKeep={} pinnedVersions={} (no data changed)",
+                    name, policy.minVersionsToKeep(), policy.pinnedVersions());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public RetentionPolicy retentionPolicy() {
+        return loadMeta().toRetentionPolicy();
+    }
+
+    @Override
+    public VacuumResult vacuum(Long expectedBaseVersion) {
+        ReentrantLock lock = lockFor();
+        lock.lock();
+        VacuumPlan plan;
+        try {
+            TableMetadata meta = loadMeta();
+            long base = meta.currentVersion;
+            if (expectedBaseVersion != null && expectedBaseVersion != base) {
+                log.info("table={} vacuum ABORTED decision=VACUUM_CONFLICT expected={} actual={}",
+                        name, expectedBaseVersion, base);
+                throw new TableException(RejectReasonCode.VACUUM_CONFLICT,
+                        "expected base version " + expectedBaseVersion + " but current version is " + base);
+            }
+            RetentionPolicy policy = meta.toRetentionPolicy();
+            if (policy == null) {
+                throw new TableException(RejectReasonCode.RETENTION_POLICY_MISSING,
+                        "table '" + name + "' has no retention policy; call setRetentionPolicy(...) before vacuum");
+            }
+
+            // Versions that must stay fully readable: latest, the recent window and every pinned version.
+            TreeSet<Long> retained = new TreeSet<>();
+            retained.add(base);
+            long windowStart = Math.max(0L, base - (long) policy.minVersionsToKeep() + 1);
+            for (long v = windowStart; v <= base; v++) {
+                retained.add(v);
+            }
+            for (Long pinned : policy.pinnedVersions()) {
+                retained.add(pinned);
+            }
+
+            // Every file in each retained version's replay chain (anchor snapshot -> version) is protected.
+            Set<String> protectedFiles = new HashSet<>();
+            for (long retainedVersion : retained) {
+                for (CommitRecord cr : replayChain(retainedVersion)) {
+                    protectedFiles.addAll(cr.dataFiles);
+                    protectedFiles.addAll(cr.deleteFiles);
+                }
+            }
+
+            // Everything a manifest ever referenced but no retained version needs is garbage.
+            TreeSet<String> garbage = new TreeSet<>();
+            for (long v = 0; v <= base; v++) {
+                CommitRecord cr = readCommit(v);
+                for (String rel : cr.dataFiles) {
+                    if (!protectedFiles.contains(rel) && Files.isRegularFile(tableDir.resolve(rel))) {
+                        garbage.add(rel);
+                    }
+                }
+                for (String rel : cr.deleteFiles) {
+                    if (!protectedFiles.contains(rel) && Files.isRegularFile(tableDir.resolve(rel))) {
+                        garbage.add(rel);
+                    }
+                }
+            }
+
+            if (garbage.isEmpty()) {
+                log.info("table={} vacuum NOOP base={} retainedVersions={} (nothing eligible)",
+                        name, base, retained);
+                return new VacuumResult(base, List.of(), 0L, new ArrayList<>(retained), List.of(), true);
+            }
+            plan = new VacuumPlan(base, new ArrayList<>(retained), new ArrayList<>(garbage));
+        } finally {
+            lock.unlock();
+        }
+
+        // Seam used by interleaving tests: a concurrent commit may land here, invalidating the premise.
+        beforeVacuumDelete(plan.baseVersion);
+
+        lock.lock();
+        try {
+            // Re-take the premise under the lock: any newer commit aborts the whole vacuum atomically.
+            long current = loadMeta().currentVersion;
+            if (current != plan.baseVersion) {
+                log.info("table={} vacuum ABORTED decision=VACUUM_CONFLICT plannedBase={} actualBase={} (nothing deleted)",
+                        name, plan.baseVersion, current);
+                throw new TableException(RejectReasonCode.VACUUM_CONFLICT,
+                        "table '" + name + "' advanced from " + plan.baseVersion + " to " + current
+                                + " while vacuum was pending; aborted without deleting any file");
+            }
+
+            List<String> deleted = new ArrayList<>();
+            long bytesReclaimed = 0L;
+            for (int i = 0; i < plan.garbageFiles.size(); i++) {
+                String rel = plan.garbageFiles.get(i);
+                Path file = tableDir.resolve(rel);
+                long size = fileSizeIfRegular(file);
+                // Seam used by interruption tests; re-running the vacuum resumes deterministically.
+                beforeVacuumFileDelete(plan.baseVersion, i, plan.garbageFiles.size());
+                if (deleteIfExists(file)) {
+                    deleted.add(rel);
+                    bytesReclaimed += size;
+                }
+            }
+
+            // A version is expired exactly when its replay chain lost at least one file.
+            List<Long> expired = new ArrayList<>();
+            for (long v = 0; v < plan.baseVersion; v++) {
+                if (plan.retainedVersions.contains(v)) {
+                    continue;
+                }
+                for (CommitRecord cr : replayChain(v)) {
+                    boolean missing = false;
+                    for (String rel : cr.dataFiles) {
+                        if (!Files.isRegularFile(tableDir.resolve(rel))) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                    if (!missing) {
+                        for (String rel : cr.deleteFiles) {
+                            if (!Files.isRegularFile(tableDir.resolve(rel))) {
+                                missing = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (missing) {
+                        expired.add(v);
+                        break;
+                    }
+                }
+            }
+
+            VacuumRecord record = new VacuumRecord(nextVacuumSequence(), plan.baseVersion,
+                    System.currentTimeMillis());
+            record.completed = true;
+            record.deletedFiles = deleted;
+            record.bytesReclaimed = bytesReclaimed;
+            record.retainedVersions = plan.retainedVersions;
+            record.expiredVersions = expired;
+            json.writeAtomic(vacuumPath(record.sequence), record);
+
+            log.info("table={} vacuum COMMITTED decision=OK base={} deletedFiles={} bytesReclaimed={} retained={} expired={}",
+                    name, plan.baseVersion, deleted.size(), bytesReclaimed,
+                    plan.retainedVersions, expired);
+            return new VacuumResult(plan.baseVersion, deleted, bytesReclaimed,
+                    plan.retainedVersions, expired, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public List<VacuumRecord> vacuumHistory() {
+        Path dir = vacuumsDir();
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        List<VacuumRecord> out = new ArrayList<>();
+        try (var stream = Files.list(dir)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".vacuum.json")).forEach(p ->
+                    out.add(json.read(p, VacuumRecord.class)));
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to list vacuum ledger of " + name, e);
+        }
+        out.sort(Comparator.comparingLong(r -> r.sequence));
+        return out;
+    }
+
+    /** Build the replay chain of a version: nearest full snapshot first, then deltas up to it. */
+    private List<CommitRecord> replayChain(long version) {
+        List<CommitRecord> chain = new ArrayList<>();
+        long cursor = version;
+        while (true) {
+            CommitRecord cr = readCommit(cursor);
+            chain.add(0, cr);
+            if (cr.fullSnapshot) {
+                break;
+            }
+            cursor--;
+        }
+        return chain;
+    }
+
+    /** Interleaving seam: invoked after planning, before the deletion phase reacquires the lock. */
+    void beforeVacuumDelete(long baseVersion) {
+        // no-op by default; tests override to run a concurrent commit
+    }
+
+    /** Interruption seam: invoked immediately before physically deleting the file at {@code index}. */
+    void beforeVacuumFileDelete(long baseVersion, int index, int total) {
+        // no-op by default; tests override to simulate a crash mid-vacuum
+    }
+
+    private long nextVacuumSequence() {
+        long max = -1L;
+        Path dir = vacuumsDir();
+        if (Files.isDirectory(dir)) {
+            try (var stream = Files.list(dir)) {
+                for (Path p : stream.toList()) {
+                    String fn = p.getFileName().toString();
+                    if (fn.endsWith(".vacuum.json")) {
+                        try {
+                            max = Math.max(max, Long.parseLong(fn.substring(0, fn.length() - ".vacuum.json".length())));
+                        } catch (NumberFormatException ignored) {
+                            // skip unrelated file
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to scan vacuum ledger of " + name, e);
+            }
+        }
+        return max + 1;
+    }
+
+    private Path vacuumsDir() {
+        return tableDir.resolve("vacuums");
+    }
+
+    private long fileSizeIfRegular(Path file) {
+        try {
+            return Files.isRegularFile(file) ? Files.size(file) : 0L;
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to stat " + file, e);
+        }
+    }
+
+    private boolean deleteIfExists(Path file) {
+        try {
+            return Files.deleteIfExists(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to delete " + file, e);
+        }
+    }
+
+    private Path vacuumPath(long sequence) {
+        return vacuumsDir().resolve(sequence + ".vacuum.json");
+    }
+
+    private record VacuumPlan(long baseVersion, List<Long> retainedVersions, List<String> garbageFiles) {
+    }
 
     private long commitSchemaChange(TableMetadata meta, Schema newSchema, String description) {
         long base = meta.currentVersion;
@@ -583,6 +866,15 @@ public final class LocalTableManager implements TableManager {
 
     private static TableException reject(RejectReasonCode code, String detail) {
         return new TableException(code, detail);
+    }
+
+    /** The version's commit manifest exists, but data it needs was reclaimed: distinct from "never existed". */
+    private TableException expired(long version, String missingRel) {
+        return new TableException(RejectReasonCode.VERSION_EXPIRED,
+                "version " + version + " of table '" + name
+                        + "' existed but its history was reclaimed by an explicit vacuum"
+                        + " (missing data file '" + missingRel + "'); it is no longer readable."
+                        + " Use currentVersion() for readable versions, or pin versions via setRetentionPolicy(...).");
     }
 
     private record PreparedOp(String key, RowOpType type, Map<String, Object> row) {

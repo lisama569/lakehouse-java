@@ -91,6 +91,24 @@ public final class LocalLakehouseDemo {
         for (CommitInfo ci : t.history()) {
             println("  v" + ci.version() + " " + ci.kind() + " : " + ci.description());
         }
+
+        println("-- retention & vacuum: pin v1, keep only the latest version otherwise --");
+        t.setRetentionPolicy(RetentionPolicy.of(1, 1L));
+        println("policy minVersionsToKeep=" + t.retentionPolicy().minVersionsToKeep()
+                + " pinnedVersions=" + t.retentionPolicy().pinnedVersions());
+        // A reclaimable full-snapshot anchor is required first (compaction above created one).
+        VacuumResult vacuum = t.vacuum(null);
+        println("vacuum noOp=" + vacuum.noOp() + " deletedFiles=" + vacuum.deletedFiles().size()
+                + " bytesReclaimed=" + vacuum.bytesReclaimed());
+        println("  retainedVersions=" + vacuum.retainedVersions());
+        println("  expiredVersions=" + vacuum.expiredVersions());
+        println("  v1 (pinned) rows=" + t.readSnapshot(1L).size());
+        println("  latest rows=" + t.readSnapshot(null).size());
+        tryReject(() -> t.readSnapshot(2L), "read reclaimed v2 (VERSION_EXPIRED, distinct from never-existed)");
+        println("  vacuum ledger entries=" + t.vacuumHistory().size());
+        VacuumResult again = t.vacuum(null);
+        println("repeat vacuum noOp=" + again.noOp() + " (idempotent, nothing more to delete)");
+
         println("== demo finished. Inspect JSON under " + warehouseRoot.resolve(tableName) + " ==");
     }
 

@@ -15,6 +15,10 @@ public final class TableMetadata {
     public List<StoredColumn> schema = new ArrayList<>();
     public List<String> primaryKey = new ArrayList<>();
 
+    /** Retention policy fields; {@code null}/absent means no policy set yet (default: keep everything). */
+    public Integer minVersionsToKeep = null;
+    public List<Long> pinnedVersions = null;
+
     public static final class StoredColumn {
         public String name;
         public String type;
@@ -57,5 +61,13 @@ public final class TableMetadata {
             map.put(c.name(), c);
         }
         return new Schema(List.copyOf(names), Map.copyOf(map), List.copyOf(primaryKey));
+    }
+
+    RetentionPolicy toRetentionPolicy() {
+        if (minVersionsToKeep == null) {
+            return null;
+        }
+        return new RetentionPolicy(minVersionsToKeep,
+                pinnedVersions == null ? List.of() : List.copyOf(pinnedVersions));
     }
 }
