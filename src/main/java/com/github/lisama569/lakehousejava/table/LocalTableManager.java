@@ -648,33 +648,26 @@ public final class LocalTableManager implements TableManager {
 
     /**
      * Build one independent full-snapshot data file per retained version, projected
-     * with that version's own schema. Replay is incremental: reuse the replayed rows
-     * at the lowest retained version, then apply each subsequent commit once.
+     * with that version's own schema.
+     *
+     * <p>Each target is resolved through {@link #collectChain(long, RetentionState)},
+     * which stops at the nearest still-readable anchor: either a natural full
+     * snapshot or a full snapshot materialized by a previous GC generation. This is
+     * essential on the second and later runs: commits between two generations may
+     * already have had their delta/delete files physically reclaimed, and replaying
+     * them directly would fail with a missing-file internal error (and re-running
+     * would fail the same way forever, because the failure happens before any new
+     * state is published). Anchoring on the prior generation's materialized
+     * snapshots makes repeated runs always succeed.</p>
      */
     private List<RetentionState.Entry> materializeRetained(List<Long> retained, long base, long generation) {
-        long min = retained.get(0);
         RetentionState currentState = loadRetentionStateOrNull();
-        TreeMap<String, Map<String, Object>> rows =
-                replayChain(collectChain(min, currentState), readCommit(min).primaryKey);
 
         List<RetentionState.Entry> entries = new ArrayList<>();
-        long cursor = min;
         for (long target : retained) {
-            while (cursor < target) {
-                cursor++;
-                CommitRecord cr = readCommit(cursor);
-                for (String rel : cr.dataFiles) {
-                    for (Map<String, Object> raw : readRows(rel)) {
-                        rows.put(encodeStoredKey(raw, cr.primaryKey), raw);
-                    }
-                }
-                for (String rel : cr.deleteFiles) {
-                    for (String key : readKeys(rel)) {
-                        rows.remove(key);
-                    }
-                }
-            }
             CommitRecord targetCommit = readCommit(target);
+            TreeMap<String, Map<String, Object>> rows =
+                    replayChain(collectChain(target, currentState), targetCommit.primaryKey);
             Schema targetSchema = targetCommit.toSchema();
             List<Map<String, Object>> snapshot = new ArrayList<>();
             for (Map<String, Object> raw : rows.values()) {
