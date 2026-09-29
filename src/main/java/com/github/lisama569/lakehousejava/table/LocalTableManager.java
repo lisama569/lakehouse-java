@@ -562,10 +562,14 @@ public final class LocalTableManager implements TableManager {
             RetentionState oldState = loadRetentionStateOrNull();
 
             // ----- decide the retained set under a fixed base -----
-            List<Long> retained = computeRetainedVersions(base, policy);
             List<Long> previouslyExpired = oldState == null
                     ? new ArrayList<>()
                     : oldState.expired.stream().map(e -> e.version).sorted().toList();
+            List<Long> retained = computeRetainedVersions(base, policy);
+            // A loosened policy (or a removed pin window) must not "revive" versions
+            // whose data files were physically reclaimed by an earlier run. They stay
+            // on the expired ledger and can never be retained/readable again.
+            retained.removeIf(previouslyExpired::contains);
 
             // Keep-all policy with no prior expiration: nothing to do, nothing to write.
             if (oldState == null && retained.size() == base + 1) {
@@ -648,34 +652,26 @@ public final class LocalTableManager implements TableManager {
 
     /**
      * Build one independent full-snapshot data file per retained version, projected
-     * with that version's own schema. Replay is incremental: reuse the replayed rows
-     * at the lowest retained version, then apply each subsequent commit once.
+     * with that version's own schema.
+     *
+     * <p>Every target is replayed through the {@link #collectChain}/{@link #replayChain}
+     * machinery used by normal snapshot reads, so materialization honors the previous
+     * GC generation's boundary snapshots: a target at or below the previous GC base
+     * starts from its (or a newer retained version's) already materialized snapshot,
+     * and a target above it replays only the post-base deltas on top of the previous
+     * base snapshot. The intermediate delta files of versions expired by an earlier
+     * GC are physically gone and must never be touched here; doing so previously made
+     * the second and later GC runs fail with an unexplained missing-file error.</p>
      */
     private List<RetentionState.Entry> materializeRetained(List<Long> retained, long base, long generation) {
-        long min = retained.get(0);
         RetentionState currentState = loadRetentionStateOrNull();
-        TreeMap<String, Map<String, Object>> rows =
-                replayChain(collectChain(min, currentState), readCommit(min).primaryKey);
 
         List<RetentionState.Entry> entries = new ArrayList<>();
-        long cursor = min;
         for (long target : retained) {
-            while (cursor < target) {
-                cursor++;
-                CommitRecord cr = readCommit(cursor);
-                for (String rel : cr.dataFiles) {
-                    for (Map<String, Object> raw : readRows(rel)) {
-                        rows.put(encodeStoredKey(raw, cr.primaryKey), raw);
-                    }
-                }
-                for (String rel : cr.deleteFiles) {
-                    for (String key : readKeys(rel)) {
-                        rows.remove(key);
-                    }
-                }
-            }
             CommitRecord targetCommit = readCommit(target);
             Schema targetSchema = targetCommit.toSchema();
+            TreeMap<String, Map<String, Object>> rows =
+                    replayChain(collectChain(target, currentState), targetCommit.primaryKey);
             List<Map<String, Object>> snapshot = new ArrayList<>();
             for (Map<String, Object> raw : rows.values()) {
                 snapshot.add(rowToOrderedMap(projectForRead(raw, targetSchema)));
